@@ -199,7 +199,7 @@ main() {
 
   # Por tu práctica, default 192.168.100.0/24:
   read -rp "Subnet (default 192.168.100.0): " subnet
-  subnet="${subnet:-192.168.100.0}"
+  subnet="${subnet:-77.77.77.1}"
   while ! is_valid_ipv4 "$subnet"; do
     echo "  -> IPv4 inválida."
     read -rp "Subnet: " subnet
