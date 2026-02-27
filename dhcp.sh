@@ -2,8 +2,7 @@
 set -euo pipefail
 
 # =========================
-# DHCP Server Automation (Linux - isc-dhcp-server)
-# Idempotent install + interactive config + monitoring
+# DHCP Server Automation 
 # =========================
 
 require_root() {

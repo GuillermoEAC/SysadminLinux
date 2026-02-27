@@ -1,443 +1,63 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/bash
 
-# =========================
-# DHCP Server Automation (Linux - isc-dhcp-server)
-# Idempotent install + static IP config + interactive config + monitoring
-# =========================
+INTERFACE="enp0s8"
+CONFIG_FILE="/etc/dhcp/dhcpd.conf"
+LEASE_FILE="/var/lib/dhcp/dhcpd.leases"
+SUBNET="192.168.100.0"
+NETMASK="255.255.255.0"
 
-require_root() {
-  if [[ "${EUID}" -ne 0 ]]; then
-    echo "ERROR: Ejecuta como root (sudo)."
-    exit 1
-  fi
+if ! dpkg -l | grep -q isc-dhcp-server; then
+    apt update -y
+    apt install isc-dhcp-server -y
+fi
+
+ip addr show $INTERFACE | grep -q "192.168.100.1"
+if [ $? -ne 0 ]; then
+    ip addr flush dev $INTERFACE
+    ip addr add 192.168.100.1/24 dev $INTERFACE
+    ip link set $INTERFACE up
+fi
+
+valid_ip() {
+    [[ $1 =~ ^192\.168\.100\.([0-9]{1,3})$ ]] && [ ${BASH_REMATCH[1]} -ge 1 ] && [ ${BASH_REMATCH[1]} -le 254 ]
 }
 
-is_valid_ipv4() {
-  local ip="$1"
-  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
-  IFS='.' read -r o1 o2 o3 o4 <<< "$ip"
-  for o in "$o1" "$o2" "$o3" "$o4"; do
-    [[ "$o" -ge 0 && "$o" -le 255 ]] || return 1
-  done
-  return 0
-}
+read -p "Nombre del Ambito: " SCOPENAME
 
-ip_to_int() {
-  local ip="$1"
-  IFS='.' read -r a b c d <<< "$ip"
-  echo $(( (a<<24) + (b<<16) + (c<<8) + d ))
-}
+until valid_ip "$START"; do
+    read -p "IP Inicial: " START
+done
 
-prompt_ipv4() {
-  local label="$1"
-  local val=""
-  while true; do
-    read -rp "$label: " val
-    if is_valid_ipv4 "$val"; then
-      echo "$val"
-      return 0
-    fi
-    echo "  -> IPv4 inválida. Ejemplo: 192.168.100.1"
-  done
-}
+until valid_ip "$END"; do
+    read -p "IP Final: " END
+done
 
-prompt_nonempty() {
-  local label="$1"
-  local val=""
-  while true; do
-    read -rp "$label: " val
-    if [[ -n "$val" ]]; then
-      echo "$val"
-      return 0
-    fi
-    echo "  -> No puede ir vacío."
-  done
-}
+read -p "Duracion del Lease en horas: " LEASEHOURS
+LEASESECONDS=$((LEASEHOURS*3600))
 
-prompt_int() {
-  local label="$1"
-  local min="$2"
-  local max="$3"
-  local val=""
-  while true; do
-    read -rp "$label ($min-$max): " val
-    if [[ "$val" =~ ^[0-9]+$ ]] && (( val >= min && val <= max )); then
-      echo "$val"
-      return 0
-    fi
-    echo "  -> Número inválido."
-  done
-}
+GATEWAY="192.168.100.1"
 
-detect_default_iface() {
-  ip route 2>/dev/null | awk '/default/ {print $5; exit}'
-}
+cat > $CONFIG_FILE <<EOF
+default-lease-time $LEASESECONDS;
+max-lease-time $LEASESECONDS;
 
-install_idempotent() {
-  if dpkg -s isc-dhcp-server >/dev/null 2>&1; then
-    echo "[OK] isc-dhcp-server ya está instalado."
-  else
-    echo "[INFO] Instalando isc-dhcp-server (modo no interactivo)..."
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -y
-    apt-get install -y isc-dhcp-server
-    echo "[OK] Instalación completa."
-  fi
-}
-
-# =========================
-# NUEVA FUNCIÓN: Configurar IP estática en la interfaz
-# =========================
-configure_static_ip() {
-  local iface="$1"
-  local static_ip="$2"
-  local netmask="$3"
-  local gateway="$4"
-  local dns="$5"
-
-  echo ""
-  echo "[INFO] Configurando IP estática $static_ip en $iface..."
-
-  # Calcular prefijo CIDR desde netmask
-  local cidr
-  cidr=$(mask_to_cidr "$netmask")
-
-  # Detectar si usamos netplan o /etc/network/interfaces
-  if command -v netplan >/dev/null 2>&1 && ls /etc/netplan/*.yaml >/dev/null 2>&1; then
-    configure_static_netplan "$iface" "$static_ip" "$cidr" "$gateway" "$dns"
-  elif [[ -f /etc/network/interfaces ]]; then
-    configure_static_interfaces "$iface" "$static_ip" "$netmask" "$gateway" "$dns"
-  else
-    echo "[WARN] No se detectó netplan ni /etc/network/interfaces."
-    echo "[INFO] Aplicando IP temporal con 'ip addr' (no persistente)..."
-    ip addr flush dev "$iface" 2>/dev/null || true
-    ip addr add "${static_ip}/${cidr}" dev "$iface"
-    ip link set "$iface" up
-    echo "[OK] IP temporal aplicada (se perderá al reiniciar)."
-    return 0
-  fi
-
-  # Verificar que la IP quedó aplicada
-  verify_static_ip "$iface" "$static_ip"
-}
-
-mask_to_cidr() {
-  local mask="$1"
-  local cidr=0
-  IFS='.' read -r a b c d <<< "$mask"
-  for oct in "$a" "$b" "$c" "$d"; do
-    local bits=0
-    local n=$oct
-    while (( n > 0 )); do
-      (( bits += n & 1 ))
-      (( n >>= 1 ))
-    done
-    (( cidr += bits ))
-  done
-  echo "$cidr"
-}
-
-configure_static_netplan() {
-  local iface="$1"
-  local ip="$2"
-  local cidr="$3"
-  local gw="$4"
-  local dns="$5"
-
-  # Buscar el archivo netplan que menciona la interfaz, o crear uno nuevo
-  local netplan_file=""
-  for f in /etc/netplan/*.yaml; do
-    if grep -q "$iface" "$f" 2>/dev/null; then
-      netplan_file="$f"
-      break
-    fi
-  done
-
-  if [[ -z "$netplan_file" ]]; then
-    netplan_file="/etc/netplan/99-dhcp-server-${iface}.yaml"
-    echo "[INFO] Creando nuevo archivo netplan: $netplan_file"
-  else
-    local backup="${netplan_file}.bak.$(date +%Y%m%d_%H%M%S)"
-    cp "$netplan_file" "$backup"
-    echo "[INFO] Backup netplan creado: $backup"
-  fi
-
-  cat > "$netplan_file" <<EOF
-network:
-  version: 2
-  renderer: networkd
-  ethernets:
-    ${iface}:
-      dhcp4: no
-      addresses:
-        - ${ip}/${cidr}
-      routes:
-        - to: default
-          via: ${gw}
-      nameservers:
-        addresses: [${dns}]
-EOF
-
-  echo "[OK] Archivo netplan escrito: $netplan_file"
-  echo "[INFO] Aplicando configuración netplan..."
-  netplan apply
-  sleep 2
-}
-
-configure_static_interfaces() {
-  local iface="$1"
-  local ip="$2"
-  local mask="$3"
-  local gw="$4"
-  local dns="$5"
-  local conf="/etc/network/interfaces"
-  local backup="${conf}.bak.$(date +%Y%m%d_%H%M%S)"
-
-  cp "$conf" "$backup"
-  echo "[INFO] Backup creado: $backup"
-
-  # Eliminar bloque existente de la interfaz (si existe)
-  # y agregar configuración estática al final
-  python3 - <<PYEOF
-import re
-
-with open('$conf', 'r') as f:
-    content = f.read()
-
-# Eliminar bloque anterior de la interfaz
-pattern = r'\nauto $iface\b.*?(?=\nauto |\niface |\Z)'
-content = re.sub(pattern, '', content, flags=re.DOTALL)
-pattern2 = r'\niface $iface\b.*?(?=\nauto |\niface |\Z)'
-content = re.sub(pattern2, '', content, flags=re.DOTALL)
-content = content.rstrip() + '\n'
-
-with open('$conf', 'w') as f:
-    f.write(content)
-PYEOF
-
-  cat >> "$conf" <<EOF
-
-auto ${iface}
-iface ${iface} inet static
-  address ${ip}
-  netmask ${mask}
-  gateway ${gw}
-  dns-nameservers ${dns}
-EOF
-
-  echo "[OK] /etc/network/interfaces actualizado."
-  echo "[INFO] Reiniciando interfaz $iface..."
-  ifdown "$iface" 2>/dev/null || true
-  ifup "$iface"
-  sleep 2
-}
-
-verify_static_ip() {
-  local iface="$1"
-  local expected_ip="$2"
-
-  echo "[INFO] Verificando que $expected_ip esté configurada en $iface..."
-  sleep 1
-
-  local assigned
-  assigned=$(ip addr show dev "$iface" 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1)
-
-  local found=0
-  for addr in $assigned; do
-    if [[ "$addr" == "$expected_ip" ]]; then
-      found=1
-      break
-    fi
-  done
-
-  if [[ "$found" -eq 1 ]]; then
-    echo "[OK] ✔ IP estática $expected_ip verificada correctamente en $iface."
-  else
-    echo "[ERROR] ✘ La IP $expected_ip NO está asignada en $iface."
-    echo "        IPs detectadas: ${assigned:-ninguna}"
-    echo "        Revisa la configuración de red manualmente."
-    read -rp "¿Deseas continuar de todas formas? (s/N): " ans
-    [[ "${ans,,}" == "s" ]] || exit 1
-  fi
-}
-
-# =========================
-
-write_config() {
-  local scope_name="$1"
-  local subnet="$2"
-  local netmask="$3"
-  local range_start="$4"
-  local range_end="$5"
-  local lease_seconds="$6"
-  local gateway="$7"
-  local dns="$8"
-
-  local conf="/etc/dhcp/dhcpd.conf"
-  local backup="/etc/dhcp/dhcpd.conf.bak.$(date +%Y%m%d_%H%M%S)"
-
-  if [[ -f "$conf" ]]; then
-    cp "$conf" "$backup"
-    echo "[INFO] Backup creado: $backup"
-  fi
-
-  cat > "$conf" <<EOF
-# =========================
-# DHCP Config (auto-generated)
-# Scope: $scope_name
-# =========================
-authoritative;
-default-lease-time $lease_seconds;
-max-lease-time $lease_seconds;
-
-option domain-name-servers $dns;
-option routers $gateway;
-
-subnet $subnet netmask $netmask {
-  range $range_start $range_end;
+subnet $SUBNET netmask $NETMASK {
+    range $START $END;
+    option routers $GATEWAY;
+    option subnet-mask $NETMASK;
+    option broadcast-address 192.168.100.255;
 }
 EOF
 
-  echo "[OK] Configuración escrita en $conf"
-}
+sed -i "s/^INTERFACESv4=.*/INTERFACESv4=\"$INTERFACE\"/" /etc/default/isc-dhcp-server
 
-set_iface_and_enable() {
-  local iface="$1"
-  local defaults="/etc/default/isc-dhcp-server"
+dhcpd -t -cf $CONFIG_FILE
 
-  if [[ -f "$defaults" ]]; then
-    if grep -q '^INTERFACESv4=' "$defaults"; then
-      sed -i "s/^INTERFACESv4=.*/INTERFACESv4=\"$iface\"/" "$defaults"
-    else
-      echo "INTERFACESv4=\"$iface\"" >> "$defaults"
-    fi
-    echo "[OK] Interfaz configurada en $defaults -> $iface"
-  else
-    echo "[WARN] No existe $defaults (en tu distro puede variar)."
-  fi
+systemctl restart isc-dhcp-server
+systemctl enable isc-dhcp-server
 
-  echo "[INFO] Validando sintaxis DHCP (dhcpd -t)..."
-  dhcpd -t -cf /etc/dhcp/dhcpd.conf
+echo "Estado del servicio:"
+systemctl status isc-dhcp-server --no-pager
 
-  systemctl enable isc-dhcp-server >/dev/null
-  systemctl restart isc-dhcp-server
-  echo "[OK] Servicio reiniciado y habilitado."
-}
-
-monitor_menu() {
-  while true; do
-    echo ""
-    echo "===== MONITOREO DHCP (Linux) ====="
-    echo "1) Ver estado del servicio"
-    echo "2) Ver leases activas (archivo dhcpd.leases)"
-    echo "3) Ver últimos logs (journalctl)"
-    echo "4) Ver IP del servidor (ip addr)"
-    echo "5) Salir"
-    read -rp "Opción: " opt
-
-    case "$opt" in
-      1)
-        systemctl status isc-dhcp-server --no-pager
-        ;;
-      2)
-        local leases="/var/lib/dhcp/dhcpd.leases"
-        if [[ -f "$leases" ]]; then
-          echo "---- Leases (resumen) ----"
-          awk '
-            $1=="lease"{ip=$2}
-            $1=="starts"{s=$0}
-            $1=="ends"{e=$0}
-            $1=="hardware"{h=$0}
-            $1=="}"{print ip"\n  "s"\n  "e"\n  "h"\n"}
-          ' "$leases" | sed '/^\s*$/d' | tail -n 120
-        else
-          echo "No existe $leases"
-        fi
-        ;;
-      3)
-        journalctl -u isc-dhcp-server -n 80 --no-pager
-        ;;
-      4)
-        ip addr show
-        ;;
-      5) break ;;
-      *) echo "Opción inválida." ;;
-    esac
-  done
-}
-
-main() {
-  require_root
-  install_idempotent
-
-  echo ""
-  echo "===== CONFIGURACIÓN DE IP ESTÁTICA DEL SERVIDOR ====="
-
-  local iface
-  iface="$(detect_default_iface || true)"
-  read -rp "Interfaz para servir DHCP (default: ${iface:-enp0s8}): " in_iface
-  iface="${in_iface:-${iface:-enp0s8}}"
-
-  echo ""
-  echo "Ingresa la IP estática que deseas asignar al servidor en la interfaz '$iface'."
-  local server_ip server_netmask server_gw server_dns_static
-
-  server_ip="$(prompt_ipv4 "IP estática del servidor (ej. 192.168.100.1)")"
-
-  read -rp "Netmask para la IP del servidor (default 255.255.255.0): " server_netmask
-  server_netmask="${server_netmask:-255.255.255.0}"
-  while ! is_valid_ipv4 "$server_netmask"; do
-    echo "  -> IPv4 inválida."
-    read -rp "Netmask: " server_netmask
-  done
-
-  server_gw="$(prompt_ipv4 "Gateway del servidor (ej. 192.168.100.254)")"
-  server_dns_static="$(prompt_ipv4 "DNS para el servidor (ej. 8.8.8.8)")"
-
-  # Configurar y verificar la IP estática
-  configure_static_ip "$iface" "$server_ip" "$server_netmask" "$server_gw" "$server_dns_static"
-
-  echo ""
-  echo "===== CONFIGURACIÓN DHCP (Linux) ====="
-  local scope_name subnet netmask start_ip end_ip lease_min lease_seconds gw dns
-
-  scope_name="$(prompt_nonempty "Nombre del Scope (descriptivo)")"
-
-  read -rp "Subnet (default 192.168.100.0): " subnet
-  subnet="${subnet:-192.168.100.0}"
-  while ! is_valid_ipv4 "$subnet"; do
-    echo "  -> IPv4 inválida."
-    read -rp "Subnet: " subnet
-  done
-
-  read -rp "Netmask (default 255.255.255.0): " netmask
-  netmask="${netmask:-255.255.255.0}"
-  while ! is_valid_ipv4 "$netmask"; do
-    echo "  -> IPv4 inválida."
-    read -rp "Netmask: " netmask
-  done
-
-  start_ip="$(prompt_ipv4 "Rango inicial (ej. 192.168.100.50)")"
-  end_ip="$(prompt_ipv4 "Rango final (ej. 192.168.100.150)")"
-
-  if (( "$(ip_to_int "$start_ip")" > "$(ip_to_int "$end_ip")" )); then
-    echo "ERROR: El rango inicial es mayor que el final."
-    exit 1
-  fi
-
-  lease_min="$(prompt_int "Lease Time en minutos" 1 10080)"
-  lease_seconds=$(( lease_min * 60 ))
-
-  gw="$(prompt_ipv4 "Gateway/Router para clientes DHCP (ej. 192.168.100.1)")"
-  dns="$(prompt_ipv4 "DNS para clientes DHCP (IP del servidor DNS de la práctica 1)")"
-
-  write_config "$scope_name" "$subnet" "$netmask" "$start_ip" "$end_ip" "$lease_seconds" "$gw" "$dns"
-  set_iface_and_enable "$iface"
-
-  echo ""
-  echo "[DONE] IP estática y DHCP configurados correctamente."
-  monitor_menu
-}
-
-main "$@"
+echo "Concesiones activas:"
+cat $LEASE_FILE
